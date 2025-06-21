@@ -1,88 +1,87 @@
+
+#!/usr/bin/env python3
+import os
 import cv2
 import numpy as np
 import mediapipe as mp
 from tensorflow.keras.models import load_model
+from tensorflow.keras.applications.efficientnet import preprocess_input
 
-# Load your trained model
-model = load_model('emotion_model.keras')
+# 0) Where your trained data folders live
+train_dir = 'data/train'
 
-# Class labels in the same order as during training
-class_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
+# 1) List & lock in your labels from the exact subfolders
+labels = sorted([
+    d for d in os.listdir(train_dir)
+    if os.path.isdir(os.path.join(train_dir, d))
+])
+print("→ Using labels (in this order):", labels)
 
-# Initialize MediaPipe Face Detection
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
-face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.2)
+# 2) Load your final model
+model = load_model('emotion_model4.keras')
 
-# Start capturing from the default webcam (index 0)
-cap = cv2.VideoCapture(0)
+# 3) MediaPipe face detector
+face_detector = mp.solutions.face_detection.FaceDetection(
+    model_selection=0,
+    min_detection_confidence=0.2
+)
+
+# 4) EMA smoothing state
+ema_pred = None
+alpha    = 0.4
+
+# 5) Video capture + target face size
+cap  = cv2.VideoCapture(0)
+size = (224, 224)
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # Convert frame to RGB for MediaPipe
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # Perform face detection
-    results = face_detection.process(rgb_frame)
+    # --- detect faces ---
+    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_detector.process(rgb)
 
     if results.detections:
-        for detection in results.detections:
-            # Get bounding box in normalized coordinates
-            bboxC = detection.location_data.relative_bounding_box
-            ih, iw, _ = frame.shape
-            x = int(bboxC.xmin * iw)
-            y = int(bboxC.ymin * ih)
-            w = int(bboxC.width * iw)
-            h = int(bboxC.height * ih)
+        # take the largest face
+        areas = [
+            d.location_data.relative_bounding_box.width *
+            d.location_data.relative_bounding_box.height
+            for d in results.detections
+        ]
+        d  = results.detections[np.argmax(areas)]
+        bb = d.location_data.relative_bounding_box
+        h, w, _ = frame.shape
+        x1, y1 = int(bb.xmin * w), int(bb.ymin * h)
+        x2, y2 = x1 + int(bb.width * w), y1 + int(bb.height * h)
 
-            # Ensure the bounding box is within frame boundaries
-            x1 = max(0, x)
-            y1 = max(0, y)
-            x2 = min(iw, x + w)
-            y2 = min(ih, y + h)
+        roi = frame[max(0,y1):y2, max(0,x1):x2]
+        if roi.size:
+            # --- preprocess exactly as at training ---
+            face = cv2.resize(roi, size)
+            face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+            inp  = preprocess_input(face.astype('float32'))
+            inp  = np.expand_dims(inp, axis=0)  # shape (1,224,224,3)
 
-            # Draw rectangle around the detected face
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            # --- predict + EMA smoothing ---
+            p        = model.predict(inp, verbose=0)[0]
+            ema_pred = p if ema_pred is None else alpha * p + (1 - alpha) * ema_pred
 
-            # Extract the region of interest (the face) and preprocess
-            face_roi = frame[y1:y2, x1:x2]
-            gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-            resized_face = cv2.resize(gray_face, (48, 48))
-            normalized_face = resized_face.astype('float32') / 255.0
-            face_input = np.expand_dims(np.expand_dims(normalized_face, axis=-1), axis=0)  # Shape: (1, 48, 48, 1)
+            # --- pick the highest-prob emotion ---
+            label = labels[np.argmax(ema_pred)]
 
-            # Run prediction
-            prediction = model.predict(face_input, verbose=0)
-            confidence = prediction.max()
+            # --- draw box & label ---
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+            cv2.putText(frame, label,
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (255,255,255), 2)
 
-            # Apply confidence threshold
-            if confidence > 0.6:
-                label = class_labels[np.argmax(prediction)]
-            else:
-                label = "Uncertain"
-
-            # Display the predicted label above the bounding box
-            cv2.putText(
-                frame,
-                label,
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2
-            )
-
-    # Show the annotated frame
-    cv2.imshow('Real-Time Emotion Detection (MediaPipe)', frame)
-
-    # Exit loop when 'q' key is pressed
+    cv2.imshow('Emotion Detection', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Release resources
 cap.release()
 cv2.destroyAllWindows()
 
